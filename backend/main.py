@@ -22,15 +22,24 @@ import numpy as np
 from pathlib import Path
 import uvicorn
 from contextlib import asynccontextmanager
+import asyncio
 
 # Import our recommendation system
 from models.recommender import CollaborativeFilteringRecommender
 from data.data_loader import MovieDataLoader
 
+# Add these imports at the top with other imports
+from services.movie_knowledge import MovieKnowledgeBase
+from services.rag_chain import MovieRecommendationRAG, RecommendationContext
+
 # Global variables for our model and data
 recommender = None
 movies_df = None
 original_ratings_df = None
+
+# Global variables for RAG system
+knowledge_base: Optional[MovieKnowledgeBase] = None
+rag_chain: Optional[MovieRecommendationRAG] = None
 
 async def load_model():
     """
@@ -39,7 +48,7 @@ async def load_model():
     This runs once when the API starts up and loads everything into memory
     for fast responses to user requests.
     """
-    global recommender, movies_df, original_ratings_df
+    global recommender, movies_df, original_ratings_df, knowledge_base, rag_chain
     
     print("🚀 Starting Movie Recommendation API...")
     
@@ -75,10 +84,47 @@ async def load_model():
                 recommender = CollaborativeFilteringRecommender()
                 recommender.fit(original_ratings_df, movies_df)
                 print("✅ Dummy model created for development!")
+        
+        # Initialize RAG system if we have movie data
+        if movies_df is not None:
+            await initialize_rag_system()
             
     except Exception as e:
         print(f"❌ Error loading model: {e}")
         print("🔧 API will run in limited mode without recommendations")
+
+
+async def initialize_rag_system():
+    """
+    Initialize the RAG system for intelligent explanations
+    """
+    global knowledge_base, rag_chain, movies_df
+    
+    try:
+        print("🧠 Initializing RAG system for intelligent explanations...")
+        
+        # Initialize knowledge base
+        knowledge_base = MovieKnowledgeBase(persist_directory="../data/movie_vectorstore")
+        
+        # Build or load the vector store
+        await asyncio.get_event_loop().run_in_executor(
+            None, 
+            knowledge_base.build_knowledge_base, 
+            movies_df, 
+            False  # Don't force rebuild if exists
+        )
+        
+        # Initialize RAG chain
+        rag_chain = MovieRecommendationRAG(knowledge_base)
+        
+        print("✅ RAG system initialized successfully!")
+        print("🔮 Enhanced explanations now available!")
+        
+    except Exception as e:
+        print(f"⚠️  Error initializing RAG system: {e}")
+        print("🔧 API will continue with basic explanations")
+        knowledge_base = None
+        rag_chain = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -367,22 +413,20 @@ async def explain_recommendation(user_id: int, movie_id: int):
     """
     Get an explanation for why a movie was recommended to a user.
     
-    This helps users understand the reasoning behind recommendations,
-    which increases trust and engagement.
+    Now enhanced with RAG (Retrieval-Augmented Generation) for intelligent,
+    contextual explanations that provide deep insights into recommendations.
     
     Args:
         user_id: The user who received the recommendation
         movie_id: The movie that was recommended
         
     Returns:
-        Detailed explanation of the recommendation
+        Detailed explanation of the recommendation with enhanced AI insights
     """
     if recommender is None or not recommender.is_trained:
         raise HTTPException(status_code=503, detail="Recommendation model not available")
     
     try:
-        explanation = recommender.explain_recommendation(user_id, movie_id)
-        
         # Get movie information
         movie_info = movies_df[movies_df['movieId'] == movie_id]
         if movie_info.empty:
@@ -390,12 +434,72 @@ async def explain_recommendation(user_id: int, movie_id: int):
         
         movie_data = movie_info.iloc[0]
         
+        # Get user profile for context
+        user_profile = None
+        try:
+            user_ratings = original_ratings_df[original_ratings_df['userId'] == user_id]
+            if not user_ratings.empty:
+                # Calculate user preferences
+                user_movies = user_ratings.merge(movies_df, on='movieId')
+                genre_ratings = []
+                
+                for _, movie in user_movies.iterrows():
+                    genres = movie['genres'].split('|')
+                    for genre in genres:
+                        genre_ratings.append({
+                            'genre': genre.strip(),
+                            'rating': movie['rating']
+                        })
+                
+                if genre_ratings:
+                    genre_df = pd.DataFrame(genre_ratings)
+                    genre_preferences = genre_df.groupby('genre')['rating'].agg(['mean', 'count']).round(2)
+                    top_genres = genre_preferences.sort_values('mean', ascending=False).head(5)
+                    
+                    user_profile = {
+                        "top_genres": top_genres.to_dict('index'),
+                        "average_rating": user_ratings['rating'].mean(),
+                        "total_ratings": len(user_ratings)
+                    }
+        except Exception as e:
+            print(f"Warning: Could not generate user profile: {e}")
+        
+        # Try to use RAG system for enhanced explanations
+        enhanced_explanation = None
+        if rag_chain and knowledge_base:
+            try:
+                # Create recommendation context
+                context = RecommendationContext(
+                    user_id=user_id,
+                    recommended_movie_id=movie_id,
+                    recommended_movie_title=movie_data['title'],
+                    recommendation_score=4.0,  # Default score
+                    recommendation_type="hybrid",
+                    user_preferences=user_profile or {},
+                    similar_movies=[]  # Could be enhanced with similarity search
+                )
+                
+                # Generate RAG-powered explanation
+                enhanced_explanation = rag_chain.generate_explanation(context)
+                
+            except Exception as e:
+                print(f"Warning: RAG explanation failed: {e}")
+        
+        # Fallback to basic explanation
+        basic_explanation = recommender.explain_recommendation(user_id, movie_id)
+        
+        # Determine which explanation to use
+        final_explanation = enhanced_explanation if enhanced_explanation else basic_explanation
+        
         return {
             "user_id": user_id,
             "movie_id": movie_id,
             "movie_title": movie_data['title'],
-            "explanation": explanation,
-            "technical_note": "This explanation is based on collaborative filtering similarity scores"
+            "explanation": final_explanation,
+            "enhanced_ai": enhanced_explanation is not None,
+            "rag_available": rag_chain is not None,
+            "user_profile_available": user_profile is not None,
+            "technical_note": "Enhanced with RAG system" if enhanced_explanation else "Basic collaborative filtering explanation"
         }
         
     except Exception as e:
