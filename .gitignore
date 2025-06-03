@@ -103,7 +103,7 @@ yarn-error.log*
 frontend/.next/
 frontend/dist/
 frontend/build/
-
+frontend/node_modules/
 # Database
 *.db
 *.sqlite3
